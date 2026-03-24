@@ -141,6 +141,16 @@ def _format_xyz(position: np.ndarray) -> str:
     return f"({position[0]:+.3f}, {position[1]:+.3f}, {position[2]:+.3f})"
 
 
+def _format_rpy_deg(rotation: np.ndarray) -> str:
+    rpy_deg = np.degrees(_rotation_to_rpy(rotation))
+    return f"({rpy_deg[0]:+.1f}, {rpy_deg[1]:+.1f}, {rpy_deg[2]:+.1f})"
+
+
+def _format_vector_deg(vector: np.ndarray) -> str:
+    vector_deg = np.degrees(vector)
+    return f"({vector_deg[0]:+.1f}, {vector_deg[1]:+.1f}, {vector_deg[2]:+.1f})"
+
+
 class ArmKinematics:
     def __init__(
         self,
@@ -280,10 +290,14 @@ class TeleopPoseTracker:
         self.angle_tolerance = math.radians(float(angle_tolerance_deg))
         self.current_pose: PoseState | None = None
         self.home_pose: PoseState | None = None
+        self.last_update_time = 0.0
+        self.message_count = 0
 
     def update(self, pose: PoseState) -> bool:
         self.current_pose = PoseState(pose.position.copy(), pose.rotation.copy())
         self.history.append(self.current_pose)
+        self.last_update_time = time.monotonic()
+        self.message_count += 1
         return self._try_lock_home()
 
     def _try_lock_home(self) -> bool:
@@ -321,6 +335,7 @@ class TeleopMirrorBridge:
         stable_frames: int,
         stable_position_tol: float,
         stable_angle_tol_deg: float,
+        debug_print_hz: float,
         network_interface: str | None = None,
     ):
         self.publish_interval = 1.0 / max(publish_hz, 1e-6)
@@ -330,6 +345,7 @@ class TeleopMirrorBridge:
         self.max_angular_speed = float(max_angular_speed)
         self.translation_scale = float(translation_scale)
         self.rotation_scale = float(rotation_scale)
+        self.debug_print_interval = 1.0 / max(debug_print_hz, 1e-6)
 
         self.lock = threading.Lock()
         self.running = False
@@ -364,7 +380,7 @@ class TeleopMirrorBridge:
         print("G1 teleop Cartesian mirror bridge")
         print("Subscribe PoseStamped topics for left/right arm end poses.")
         print("Wait for stable startup frames, lock them as teleop home poses,")
-        print("then apply relative teleop deltas on top of the G1 home poses.")
+        print("then apply teleop deltas to the G1 home poses in the world frame.")
         print("=" * 72)
         if network_interface:
             print(f"[DDS] interface={network_interface}")
@@ -447,13 +463,93 @@ class TeleopMirrorBridge:
         teleop_home = tracker.home_pose
         teleop_current = tracker.current_pose
 
-        delta_position_local = teleop_home.rotation.T @ (teleop_current.position - teleop_home.position)
-        delta_rotation = teleop_home.rotation.T @ teleop_current.rotation
-        delta_rotvec = _rotation_matrix_to_rotvec(delta_rotation)
+        delta_position_world = teleop_current.position - teleop_home.position
+        delta_rotation_world = teleop_current.rotation @ teleop_home.rotation.T
+        delta_rotvec_world = _rotation_matrix_to_rotvec(delta_rotation_world)
 
-        target_position = robot_home.position + robot_home.rotation @ (self.translation_scale * delta_position_local)
-        target_rotation = robot_home.rotation @ _rotvec_to_matrix(self.rotation_scale * delta_rotvec)
+        target_position = robot_home.position + self.translation_scale * delta_position_world
+        target_rotation = _rotvec_to_matrix(self.rotation_scale * delta_rotvec_world) @ robot_home.rotation
         return PoseState(target_position, target_rotation)
+
+    def _build_debug_lines_for_arm_locked(self, arm_name: str, current_pose: PoseState, target_pose: PoseState) -> list[str]:
+        tracker = self.trackers[arm_name]
+        robot_home = self.robot_home_pose[arm_name]
+        now = time.monotonic()
+        if tracker.last_update_time > 0.0:
+            teleop_age = now - tracker.last_update_time
+            teleop_age_text = f"{teleop_age:.3f}s"
+        else:
+            teleop_age_text = "n/a"
+
+        lines = [
+            f"[{arm_name.upper()}][TELEOP] msgs={tracker.message_count} age={teleop_age_text} "
+            f"home={'yes' if tracker.home_pose is not None else 'no'}"
+        ]
+
+        if tracker.current_pose is None:
+            lines.append(f"[{arm_name.upper()}][TELEOP] current=none")
+        else:
+            lines.append(
+                f"[{arm_name.upper()}][TELEOP] current_xyz={_format_xyz(tracker.current_pose.position)} "
+                f"current_rpy_deg={_format_rpy_deg(tracker.current_pose.rotation)}"
+            )
+
+        if tracker.home_pose is None or tracker.current_pose is None:
+            lines.append(f"[{arm_name.upper()}][TELEOP] home/delta=waiting_for_stable_frames")
+            teleop_delta_world = np.zeros(3, dtype=float)
+            teleop_delta_local = np.zeros(3, dtype=float)
+            teleop_delta_rotvec_local = np.zeros(3, dtype=float)
+            teleop_delta_rotvec_world = np.zeros(3, dtype=float)
+        else:
+            teleop_delta_world = tracker.current_pose.position - tracker.home_pose.position
+            teleop_delta_local = tracker.home_pose.rotation.T @ teleop_delta_world
+            teleop_delta_rotvec_local = _rotation_matrix_to_rotvec(
+                tracker.home_pose.rotation.T @ tracker.current_pose.rotation
+            )
+            teleop_delta_rotvec_world = _rotation_matrix_to_rotvec(
+                tracker.current_pose.rotation @ tracker.home_pose.rotation.T
+            )
+            lines.append(
+                f"[{arm_name.upper()}][TELEOP] home_xyz={_format_xyz(tracker.home_pose.position)} "
+                f"home_rpy_deg={_format_rpy_deg(tracker.home_pose.rotation)}"
+            )
+            lines.append(
+                f"[{arm_name.upper()}][TELEOP] delta_world_xyz={_format_xyz(teleop_delta_world)} "
+                f"delta_local_xyz={_format_xyz(teleop_delta_local)} "
+                f"delta_rotvec_world_deg={_format_vector_deg(teleop_delta_rotvec_world)} "
+                f"delta_rotvec_local_deg={_format_vector_deg(teleop_delta_rotvec_local)}"
+            )
+
+        target_delta_world = target_pose.position - robot_home.position
+        target_delta_rotvec_world = _rotation_matrix_to_rotvec(target_pose.rotation @ robot_home.rotation.T)
+        target_delta_rotvec_local = _rotation_matrix_to_rotvec(robot_home.rotation.T @ target_pose.rotation)
+        position_error = target_pose.position - current_pose.position
+        angular_error = _rotation_matrix_to_rotvec(target_pose.rotation @ current_pose.rotation.T)
+        joint_values = ", ".join(f"{value:+.3f}" for value in self.arms[arm_name].joint_positions)
+
+        lines.append(
+            f"[{arm_name.upper()}][G1] home_xyz={_format_xyz(robot_home.position)} "
+            f"home_rpy_deg={_format_rpy_deg(robot_home.rotation)}"
+        )
+        lines.append(
+            f"[{arm_name.upper()}][G1] target_xyz={_format_xyz(target_pose.position)} "
+            f"target_rpy_deg={_format_rpy_deg(target_pose.rotation)}"
+        )
+        lines.append(
+            f"[{arm_name.upper()}][G1] current_xyz={_format_xyz(current_pose.position)} "
+            f"current_rpy_deg={_format_rpy_deg(current_pose.rotation)}"
+        )
+        lines.append(
+            f"[{arm_name.upper()}][MAP] target_delta_xyz={_format_xyz(target_delta_world)} "
+            f"target_delta_rotvec_world_deg={_format_vector_deg(target_delta_rotvec_world)} "
+            f"target_delta_rotvec_local_deg={_format_vector_deg(target_delta_rotvec_local)}"
+        )
+        lines.append(
+            f"[{arm_name.upper()}][ERR] pos_xyz={_format_xyz(position_error)} "
+            f"rotvec_deg={_format_vector_deg(angular_error)}"
+        )
+        lines.append(f"[{arm_name.upper()}][JOINT] q=[{joint_values}]")
+        return lines
 
     def _build_twist(self, current_pose: PoseState, target_pose: PoseState) -> np.ndarray:
         position_error = target_pose.position - current_pose.position
@@ -492,16 +588,17 @@ class TeleopMirrorBridge:
                 positions = self._compose_positions_locked()
 
                 now = time.monotonic()
-                if now - self.last_status_print_ts > 1.0:
-                    left_home_ready = self.trackers["left"].home_pose is not None
-                    right_home_ready = self.trackers["right"].home_pose is not None
-                    print(
-                        "[STATUS] "
-                        f"left_home={'yes' if left_home_ready else 'no'} "
-                        f"right_home={'yes' if right_home_ready else 'no'} "
-                        f"left_target={_format_xyz(target_pose['left'].position)} "
-                        f"right_target={_format_xyz(target_pose['right'].position)}"
-                    )
+                if now - self.last_status_print_ts > self.debug_print_interval:
+                    print("=" * 72)
+                    print(f"[DEBUG] t={now:.3f}")
+                    for arm_name in ("left", "right"):
+                        current_pose = self.arms[arm_name].get_pose()
+                        for line in self._build_debug_lines_for_arm_locked(
+                            arm_name,
+                            current_pose=current_pose,
+                            target_pose=target_pose[arm_name],
+                        ):
+                            print(line)
                     self.last_status_print_ts = now
 
             self.publisher.publish_positions(positions)
@@ -617,6 +714,7 @@ def main():
     parser.add_argument("--stable_angle_tol_deg", type=float, default=5.0, help="Maximum orientation deviation for home-pose locking in degrees")
     parser.add_argument("--translation_scale", type=float, default=1.0, help="Scale applied to teleop translation deltas")
     parser.add_argument("--rotation_scale", type=float, default=1.0, help="Scale applied to teleop rotation deltas")
+    parser.add_argument("--debug_print_hz", type=float, default=1.0, help="Detailed debug print frequency")
     parser.add_argument("--position_gain", type=float, default=4.0, help="Position tracking gain")
     parser.add_argument("--orientation_gain", type=float, default=5.0, help="Orientation tracking gain")
     parser.add_argument("--max_linear_speed", type=float, default=0.35, help="Maximum Cartesian tracking linear speed in m/s")
@@ -642,6 +740,7 @@ def main():
         stable_frames=args.stable_frames,
         stable_position_tol=args.stable_position_tol,
         stable_angle_tol_deg=args.stable_angle_tol_deg,
+        debug_print_hz=args.debug_print_hz,
         network_interface=network_interface,
     )
     bridge.start()
