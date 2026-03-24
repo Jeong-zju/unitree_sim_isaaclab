@@ -3,6 +3,7 @@
 publish reset category command to rt/reset_pose/cmd
 """
 
+import argparse
 import time
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
@@ -361,8 +362,12 @@ def publish_reset_category(category: int,publisher):
     # print(f"published reset category: {category}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="8BitDo base velocity sender")
+    parser.add_argument("--network_interface", type=str, default=None, help="DDS network interface, e.g. enp3s0")
+    args = parser.parse_args()
+
     # initialize DDS
-    ChannelFactoryInitialize(1)
+    ChannelFactoryInitialize(1, args.network_interface)
     publisher = ChannelPublisher("rt/run_command/cmd", String_)
     publisher.Init()
     gamepad_controller = GamepadController()

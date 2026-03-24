@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Unitree Robotics Co., Ltd. All Rights Reserved.
 # License: Apache License, Version 2.0
+import os
 import time
 import threading
 from typing import Dict, List, Optional
@@ -57,9 +58,13 @@ class DDSManager:
             return True
         
         try:
-            ChannelFactoryInitialize(1)
+            dds_interface = os.getenv("UNITREE_DDS_INTERFACE") or None
+            ChannelFactoryInitialize(1, dds_interface)
             self.dds_initialized = True
-            print("[DDSManager] DDS system initialized")
+            if dds_interface:
+                print(f"[DDSManager] DDS system initialized on interface: {dds_interface}")
+            else:
+                print("[DDSManager] DDS system initialized")
             return True
         except Exception as e:
             print(f"[DDSManager] DDS system initialization failed: {e}")

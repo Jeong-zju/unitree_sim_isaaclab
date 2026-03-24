@@ -3,6 +3,7 @@
 使用 pynput 库实现键盘控制
 """
 
+import argparse
 import time
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
@@ -11,7 +12,6 @@ import threading
 import math
 import numpy as np
 import time
-from pynput import keyboard
 
 
 class LowPassFilter:
@@ -30,7 +30,7 @@ class LowPassFilter:
 
 
 class KeyboardController:
-    def __init__(self):
+    def __init__(self, keyboard_module):
         self.control_params = {
             'x_vel': 0.0,
             'y_vel': 0.0,
@@ -83,9 +83,9 @@ class KeyboardController:
         self._control_thread.start()
 
         # Start keyboard listener
-        self._start_keyboard_listener()
+        self._start_keyboard_listener(keyboard_module)
 
-    def _start_keyboard_listener(self):
+    def _start_keyboard_listener(self, keyboard_module):
         """start keyboard listener"""
         def on_press(key):
             """key press event"""
@@ -122,7 +122,7 @@ class KeyboardController:
                 pass
 
         # start keyboard listener
-        self.listener = keyboard.Listener(
+        self.listener = keyboard_module.Listener(
             on_press=on_press,
             on_release=on_release
         )
@@ -237,6 +237,10 @@ def publish_reset_category(category, publisher):
     # print(f"published reset category: {category}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="keyboard base velocity sender")
+    parser.add_argument("--network_interface", type=str, default=None, help="DDS network interface, e.g. enp3s0")
+    args = parser.parse_args()
+
     print("=" * 50)
     print("keyboard control instructions (pynput version):")
     print("W: forward    S: backward")
@@ -260,13 +264,13 @@ if __name__ == "__main__":
             
         # initialize DDS
         print("initializing DDS communication...")
-        ChannelFactoryInitialize(1)
+        ChannelFactoryInitialize(1, args.network_interface)
         publisher = ChannelPublisher("rt/run_command/cmd", String_)
         publisher.Init()
         print("DDS communication initialized")
         
         print("initializing keyboard controller...")
-        keyboard_controller = KeyboardController()
+        keyboard_controller = KeyboardController(keyboard_module=keyboard)
         default_height = 0.8
         
         print("=" * 50)

@@ -73,12 +73,15 @@ parser.add_argument("--camera_jpeg_quality", type=int, default=85, help="JPEG qu
 parser.add_argument("--physx_substeps", type=int, default=None, help="physx substeps per step")
 parser.add_argument("--camera_include", type=str, default="front_camera,left_wrist_camera,right_wrist_camera", help="comma-separated camera names to enable")
 parser.add_argument("--camera_exclude", type=str, default="world_camera", help="comma-separated camera names to disable")
+parser.add_argument("--dds_interface", type=str, default=None, help="DDS network interface, e.g. enp3s0")
 
 parser.add_argument("--env_reward_interval", type=int, default=5, help="environment reward compute interval (steps)")
 parser.add_argument("--seed", type=int, default=42, help="environment seed")
 # add AppLauncher parameters
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.dds_interface:
+    os.environ["UNITREE_DDS_INTERFACE"] = args_cli.dds_interface
 if args_cli.no_render:
     os.environ["LIVESTREAM"] = str(args_cli.livestream_type)
     os.environ["PUBLIC_IP"] = args_cli.public_ip

@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Unitree Robotics Co., Ltd. All Rights Reserved.
 # License: Apache License, Version 2.0
 from action_provider.action_base import ActionProvider
+from action_provider.arm_command_utils import apply_arm_command_message
 from typing import Optional
 import torch
 from dds.dds_master import dds_manager
@@ -19,6 +20,7 @@ class DDSActionProvider(ActionProvider):
         self.gripper_dds = None
         self.dex3_dds = None
         self.inspire_dds = None
+        self.arm_command_dds = None
         self._setup_dds()
         self._setup_joint_mapping()
     
@@ -30,6 +32,7 @@ class DDSActionProvider(ActionProvider):
         try:
             if self.enable_robot == "g129" or self.enable_robot == "h1_2":
                 self.robot_dds = dds_manager.get_object("g129")
+                self.arm_command_dds = dds_manager.get_object("arm_command")
             if self.enable_gripper:
                 self.gripper_dds = dds_manager.get_object("dex1")
             elif self.enable_dex3:
@@ -61,6 +64,10 @@ class DDSActionProvider(ActionProvider):
             }
             self.all_joint_names = self.env.scene["robot"].data.joint_names
             self.joint_to_index = {name: i for i, name in enumerate(self.all_joint_names)}
+            self.arm_joint_names = list(self.arm_joint_mapping.keys())
+            self.arm_joint_name_to_local_index = {
+                name: idx for idx, name in enumerate(self.arm_joint_names)
+            }
             self.arm_action_pose = [self.joint_to_index[name] for name in self.arm_joint_mapping.keys()]
             self.arm_action_pose_indices = [self.arm_joint_mapping[name] for name in self.arm_joint_mapping.keys()]
             self._arm_target_indices = [self.joint_to_index[name] for name in self.arm_joint_mapping.keys()]
@@ -85,6 +92,10 @@ class DDSActionProvider(ActionProvider):
             print(f"self.env.scene['robot'].data.joint_names: {self.env.scene['robot'].data.joint_names}")
             self.all_joint_names = self.env.scene["robot"].data.joint_names
             self.joint_to_index = {name: i for i, name in enumerate(self.all_joint_names)}
+            self.arm_joint_names = list(self.arm_joint_mapping.keys())
+            self.arm_joint_name_to_local_index = {
+                name: idx for idx, name in enumerate(self.arm_joint_names)
+            }
             self.arm_action_pose = [self.joint_to_index[name] for name in self.arm_joint_mapping.keys()]
             self.arm_action_pose_indices = [self.arm_joint_mapping[name] for name in self.arm_joint_mapping.keys()]
             self._arm_target_indices = [self.joint_to_index[name] for name in self.arm_joint_mapping.keys()]
@@ -165,6 +176,8 @@ class DDSActionProvider(ActionProvider):
         device = self.env.device
         self._arm_target_idx_t = torch.tensor(self._arm_target_indices, dtype=torch.long, device=device)
         self._arm_source_idx_t = torch.tensor(self._arm_source_indices, dtype=torch.long, device=device)
+        self._arm_command_state = torch.zeros(len(self._arm_target_indices), device=device, dtype=torch.float32)
+        self._simple_arm_command_active = False
         if self.enable_gripper:
             self._gripper_target_idx_t = torch.tensor(self._gripper_target_indices, dtype=torch.long, device=device)
             self._gripper_source_idx_t = torch.tensor(self._gripper_source_indices, dtype=torch.long, device=device)
@@ -189,6 +202,37 @@ class DDSActionProvider(ActionProvider):
             self._right_hand_buf = torch.empty(len(self._right_hand_source_indices), device=device, dtype=torch.float32)
         if self.enable_inspire:
             self._inspire_buf = torch.empty(12, device=device, dtype=torch.float32)
+
+    def _apply_arm_targets(self, full_action: torch.Tensor):
+        if self.arm_command_dds:
+            arm_cmd_data = self.arm_command_dds.get_arm_command()
+            raw_arm_command = arm_cmd_data.get("arm_command") if arm_cmd_data else None
+            if apply_arm_command_message(
+                raw_arm_command,
+                self.arm_joint_names,
+                self.arm_joint_name_to_local_index,
+                self._arm_command_state,
+            ):
+                self._simple_arm_command_active = True
+
+        if self._simple_arm_command_active:
+            full_action.index_copy_(0, self._arm_target_idx_t, self._arm_command_state)
+            return
+
+        if self.robot_dds is None:
+            return
+
+        cmd_data = self.robot_dds.get_robot_command()
+        if not (cmd_data and "motor_cmd" in cmd_data):
+            return
+
+        positions = cmd_data["motor_cmd"]["positions"]
+        if len(positions) < 29:
+            return
+
+        self._positions_buf[:29].copy_(torch.tensor(positions[:29], dtype=torch.float32, device=self.env.device))
+        arm_vals = self._positions_buf.index_select(0, self._arm_source_idx_t)
+        full_action.index_copy_(0, self._arm_target_idx_t, arm_vals)
     
     def get_action(self, env) -> Optional[torch.Tensor]:
         """Get action from DDS"""
@@ -196,22 +240,8 @@ class DDSActionProvider(ActionProvider):
 
             full_action = self._full_action_buf
             full_action.zero_()
-            if self.enable_robot == "g129" and self.robot_dds:
-                cmd_data = self.robot_dds.get_robot_command()
-                if cmd_data and 'motor_cmd' in cmd_data:
-                    positions = cmd_data['motor_cmd']['positions']
-                    if len(positions) >= 29:
-                        self._positions_buf[:29].copy_(torch.tensor(positions[:29], dtype=torch.float32, device=self.env.device))
-                        arm_vals = self._positions_buf.index_select(0, self._arm_source_idx_t)
-                        full_action.index_copy_(0, self._arm_target_idx_t, arm_vals)
-            elif self.enable_robot == "h1_2" and self.robot_dds:
-                cmd_data = self.robot_dds.get_robot_command()
-                if cmd_data and 'motor_cmd' in cmd_data:
-                    positions = cmd_data['motor_cmd']['positions']
-                    if len(positions) >= 29:
-                        self._positions_buf[:29].copy_(torch.tensor(positions[:29], dtype=torch.float32, device=self.env.device))
-                        arm_vals = self._positions_buf.index_select(0, self._arm_source_idx_t)
-                        full_action.index_copy_(0, self._arm_target_idx_t, arm_vals)
+            if self.enable_robot == "g129" or self.enable_robot == "h1_2":
+                self._apply_arm_targets(full_action)
             # Get gripper command
             if self.gripper_dds:
                 gripper_cmd = self.gripper_dds.get_gripper_command()

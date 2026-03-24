@@ -11,6 +11,10 @@ def create_dds_objects(args_cli,env):
         dds_manager.register_object("g129", g1_robot)
         publish_names.append("g129")
         subscribe_names.append("g129")
+        from dds.arm_command_dds import ArmCommandDDS
+        arm_command = ArmCommandDDS()
+        dds_manager.register_object("arm_command", arm_command)
+        subscribe_names.append("arm_command")
     if args_cli.enable_dex3_dds:
         from dds.dex3_dds import Dex3DDS
         dex3 = Dex3DDS() 
@@ -61,6 +65,10 @@ def create_dds_objects_replay(args_cli,env):
         dds_manager.register_object("g129", g1_robot)
         publish_names.append("g129")
         subscribe_names.append("g129")
+        from dds.arm_command_dds import ArmCommandDDS
+        arm_command = ArmCommandDDS()
+        dds_manager.register_object("arm_command", arm_command)
+        subscribe_names.append("arm_command")
     if args_cli.enable_dex3_dds:
         from dds.dex3_dds import Dex3DDS
         dex3 = Dex3DDS() 

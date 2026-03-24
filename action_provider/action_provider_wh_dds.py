@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Unitree Robotics Co., Ltd. All Rights Reserved.
 # License: Apache License, Version 2.0
 from action_provider.action_base import ActionProvider
+from action_provider.arm_command_utils import apply_arm_command_message
 from typing import Optional
 import torch
 from dds.dds_master import dds_manager
@@ -30,6 +31,7 @@ class DDSRLActionProvider(ActionProvider):
         self.gripper_dds = None
         self.dex3_dds = None
         self.inspire_dds = None
+        self.arm_command_dds = None
         self.run_command = None
         self._setup_dds()
         self._setup_joint_mapping()
@@ -70,6 +72,9 @@ class DDSRLActionProvider(ActionProvider):
         
         self._full_action_buf = torch.zeros(len(self.all_joint_names), device=device, dtype=torch.float32)
         self._positions_buf = torch.empty(29, device=device, dtype=torch.float32)
+        self._arm_command_state = torch.zeros(len(self._arm_target_indices), device=device, dtype=torch.float32)
+        self._simple_arm_command_active = False
+        self._last_arm_command_log_ts = 0.0
         if self.enable_gripper:
             self._gripper_buf = torch.empty(2, device=device, dtype=torch.float32)
         if self.enable_dex3:
@@ -86,6 +91,7 @@ class DDSRLActionProvider(ActionProvider):
         try:
             if self.enable_robot == "g129":
                 self.robot_dds = dds_manager.get_object("g129")
+                self.arm_command_dds = dds_manager.get_object("arm_command")
             if self.enable_gripper:
                 self.gripper_dds = dds_manager.get_object("dex1")
             elif self.enable_dex3:
@@ -240,6 +246,9 @@ class DDSRLActionProvider(ActionProvider):
             }
         self.all_joint_names = self.env.scene["robot"].data.joint_names
         self.joint_to_index = {name: i for i, name in enumerate(self.all_joint_names)}
+        self.arm_joint_name_to_local_index = {
+            name: idx for idx, name in enumerate(self.arm_joint_names)
+        }
         self.arm_action_pose = [self.joint_to_index[name] for name in self.arm_joint_mapping.keys()]
         self.arm_action_pose_indices = [self.arm_joint_mapping[name] for name in self.arm_joint_mapping.keys()]
         self.action_to_indices=[]
@@ -293,6 +302,50 @@ class DDSRLActionProvider(ActionProvider):
         self.clip_actions = 100
         self.action_scale = 0.25
         self.sim_step_counter = 0
+
+    def _apply_arm_targets(self, full_action: torch.Tensor):
+        if self.arm_command_dds:
+            arm_cmd_data = self.arm_command_dds.get_arm_command()
+            raw_arm_command = arm_cmd_data.get("arm_command") if arm_cmd_data else None
+            if apply_arm_command_message(
+                raw_arm_command,
+                self.arm_joint_names,
+                self.arm_joint_name_to_local_index,
+                self._arm_command_state,
+            ):
+                self._simple_arm_command_active = True
+                now = time.perf_counter()
+                if now - self._last_arm_command_log_ts > 0.5:
+                    left_shoulder = float(self._arm_command_state[0].item())
+                    left_elbow = float(self._arm_command_state[3].item())
+                    right_shoulder = float(self._arm_command_state[7].item())
+                    right_elbow = float(self._arm_command_state[10].item())
+                    print(
+                        "[DDSRLActionProvider] arm_command received "
+                        f"L(sp={left_shoulder:+.3f}, eb={left_elbow:+.3f}) "
+                        f"R(sp={right_shoulder:+.3f}, eb={right_elbow:+.3f})"
+                    )
+                    self._last_arm_command_log_ts = now
+
+        if self._simple_arm_command_active:
+            full_action.index_copy_(0, self._arm_target_idx_t, self._arm_command_state)
+            return
+
+        if self.robot_dds is None:
+            return
+
+        cmd_data = self.robot_dds.get_robot_command()
+        if not (cmd_data and "motor_cmd" in cmd_data):
+            return
+
+        positions = cmd_data["motor_cmd"]["positions"]
+        if len(positions) < 29:
+            return
+
+        self._positions_buf[:29].copy_(torch.tensor(positions[:29], dtype=torch.float32, device=self.env.device))
+        arm_vals = self._positions_buf.index_select(0, self._arm_source_idx_t)
+        full_action.index_copy_(0, self._arm_target_idx_t, arm_vals)
+
     def load_policy(self,path):
         ext = os.path.splitext(path)[1].lower()
         if ext==".onnx":
@@ -382,15 +435,8 @@ class DDSRLActionProvider(ActionProvider):
             # RL 输出与腰部默认位姿
             full_action[self.action_to_indices] = action_data
             full_action[self.waist_to_all_indices] = self.default_waist_positions
-            # 机器人指令（若有）
-            if self.enable_robot == "g129" and self.robot_dds:
-                cmd_data = self.robot_dds.get_robot_command()
-                if cmd_data and 'motor_cmd' in cmd_data:
-                    positions = cmd_data['motor_cmd']['positions']
-                    if len(positions) >= 29 and hasattr(self, "_arm_source_idx_t"):
-                        self._positions_buf[:29].copy_(torch.tensor(positions[:29], dtype=torch.float32, device=self.env.device))
-                        arm_vals = self._positions_buf.index_select(0, self._arm_source_idx_t)
-                        full_action.index_copy_(0, self._arm_target_idx_t, arm_vals)
+            if self.enable_robot == "g129":
+                self._apply_arm_targets(full_action)
             # 延时/裁剪/缩放
             delayed_actions = self.action_buffer.compute(full_action[self.old_action_indices].unsqueeze(0))
             cliped_actions = torch.clip(delayed_actions[:,self.action_to_indices], -self.clip_actions, self.clip_actions).to(self.env.device)
